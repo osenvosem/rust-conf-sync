@@ -207,7 +207,7 @@ fn main() -> anyhow::Result<()> {
                     _ => {}
                 },
                 notify::EventKind::Remove(remove_kind) => match remove_kind {
-                    notify::event::RemoveKind::File => {
+                    notify::event::RemoveKind::Any => {
                         let attachments =
                             get_attachment_list(&client, &username, &password, &common_api_url)
                                 .unwrap();

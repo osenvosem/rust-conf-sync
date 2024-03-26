@@ -17,7 +17,7 @@ use shellexpand;
 use std::{
     env, fs,
     io::{Cursor, Read},
-    path::Path,
+    path::{Path, MAIN_SEPARATOR_STR},
     sync::{self, Arc},
     thread,
     time::Duration,
@@ -63,10 +63,10 @@ fn main() -> anyhow::Result<()> {
         if let Ok(parsed) = val.parse() {
             parsed
         } else {
-            5
+            10
         }
     } else {
-        5
+        10
     };
 
     let page_id = get_page_id(&client, &username, &password, &page_url);
@@ -83,6 +83,19 @@ fn main() -> anyhow::Result<()> {
     }
 
     fs::create_dir_all(&sync_dir).expect("Could not create sync dir");
+
+    initial_sync(
+        client.clone(),
+        username.clone(),
+        password.clone(),
+        common_api_url.clone(),
+        ignore_files_vec
+            .clone()
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        sync_dir.clone(),
+    );
 
     let (tx, rx) = sync::mpsc::channel();
     let (block_tx, block_rx) = sync::mpsc::channel::<bool>();
@@ -191,12 +204,6 @@ fn main() -> anyhow::Result<()> {
                             }
                         }
                     }
-                    // notify::event::ModifyKind::Data(_) => {
-                    //     let (file_path, _) =
-                    //         helpers::get_path_filename(&event.paths.get(0).unwrap());
-
-                    //     upload_file(&client, &username, &password, &common_api_url, &file_path);
-                    // }
                     _ => {}
                 },
                 notify::EventKind::Remove(remove_kind) => match remove_kind {
@@ -205,9 +212,18 @@ fn main() -> anyhow::Result<()> {
                             get_attachment_list(&client, &username, &password, &common_api_url)
                                 .unwrap();
                         let (_, filename) = helpers::get_path_filename(event.paths.get(0).unwrap());
-                        let remote_att = attachments.iter().find(|a| a.title == filename).unwrap();
-
-                        delete_file(&client, &username, &password, &base_api_url, &remote_att.id)?;
+                        match attachments.iter().find(|a| a.title == filename) {
+                            Some(remote_att) => {
+                                delete_file(
+                                    &client,
+                                    &username,
+                                    &password,
+                                    &base_api_url,
+                                    &remote_att.id,
+                                )?;
+                            }
+                            None => {}
+                        }
                     }
                     _ => {}
                 },
@@ -308,7 +324,6 @@ fn upload_file(
         .send()
         .expect("Error upload file");
 
-    // log::debug!("{:#?}", res);
     log::debug!("upload_file");
 
     Ok(())
@@ -344,7 +359,6 @@ fn update_file(
         .multipart(form)
         .send()?;
 
-    // log::debug!("{:#?}", res);
     log::debug!("update_file");
 
     Ok(())
@@ -369,9 +383,72 @@ fn delete_file(
         .send()
         .expect("Error delete file");
 
-    // log::debug!("{:#?}", res);
     log::debug!("delete_file");
 
+    Ok(())
+}
+
+fn initial_sync(
+    client: reqwest::blocking::Client,
+    username: String,
+    password: String,
+    url: String,
+    ignore_files: Vec<String>,
+    sync_dir: String,
+) -> anyhow::Result<()> {
+    let attachments = get_attachment_list(&client, &username, &password, &url).unwrap();
+
+    let dir_contents = fs::read_dir(&sync_dir).expect("Error reading local files");
+
+    let local_files = get_local_filenames(
+        dir_contents,
+        &ignore_files.iter().map(|s| s.as_str()).collect(),
+    );
+
+    let (_, up_diff, down_diff) = calc_file_difference(&attachments, &local_files);
+
+    if !up_diff.is_empty() {
+        let scheme = Url::parse(&url).unwrap().scheme().to_string();
+        let domain = Url::parse(&url).unwrap().host().unwrap().to_string();
+
+        up_diff.iter().for_each(|file_name| {
+            let Attachment {
+                download_link,
+                title,
+                ..
+            } = attachments
+                .iter()
+                .find(|att| att.title.contains(file_name))
+                .unwrap();
+            let download_url = format!("{scheme}://{domain}{download_link}");
+
+            download_file(
+                &client,
+                &username,
+                &password,
+                &download_url,
+                &title,
+                &sync_dir,
+            );
+            ()
+        });
+        thread::sleep(Duration::from_millis(500));
+    }
+
+    if !down_diff.is_empty() {
+        let dir_contents = fs::read_dir(&sync_dir).expect("Error reading local files");
+        let down_diff_paths = dir_contents
+            .map(|p| p.unwrap().path().to_string_lossy().to_string())
+            .filter(|res| down_diff.iter().any(|pat| res.contains(pat)))
+            .collect::<Vec<String>>();
+
+        down_diff_paths.iter().for_each(|file_path| {
+            upload_file(&client, &username, &password, &url, file_path);
+            ()
+        });
+    }
+
+    log::debug!("Initial sync");
     Ok(())
 }
 
@@ -387,12 +464,12 @@ fn download_file(
         .get(file_download_url)
         .send()
         .expect("Error download file");
-    let sep = std::path::MAIN_SEPARATOR_STR;
-    let file_local_path = format!("{sync_dir}{sep}{file_name}");
+    let file_local_path = format!("{sync_dir}{MAIN_SEPARATOR_STR}{file_name}");
     let mut file = fs::File::create(file_local_path).unwrap();
     let mut content = Cursor::new(res.bytes().expect("Error get downloaded file contents"));
     std::io::copy(&mut content, &mut file);
 
+    log::debug!("Download file");
     Ok(())
 }
 
@@ -455,10 +532,16 @@ fn start_polling_thread(
                 .filter(|res| down_diff.iter().any(|pat| res.contains(pat)))
                 .collect::<Vec<String>>();
 
+            tx.send(true).unwrap();
             down_diff_paths.iter().for_each(|file_path| {
-                upload_file(&client, &username, &password, &url, file_path);
+                match fs::remove_file(&file_path) {
+                    Ok(_) => log::debug!("File removed {}", file_path),
+                    Err(err) => log::error!("{err}:?"),
+                }
                 ()
             });
+            thread::sleep(Duration::from_millis(500));
+            tx.send(false).unwrap();
         }
 
         thread::sleep(Duration::from_secs(poll_interval));
